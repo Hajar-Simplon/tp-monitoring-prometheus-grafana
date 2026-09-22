@@ -1,16 +1,19 @@
 # Monitoring with Prometheus Node Exporter and Grafana
 
-This project deploys a local monitoring stack with Docker Compose. Node Exporter exposes Linux host metrics, Prometheus collects them using its pull model, and Grafana displays them in dashboards.
+This project deploys a local monitoring stack with Docker Compose. Node Exporter exposes Linux host metrics, Prometheus collects them using its pull model, and Grafana displays them in dashboards. The bonus implementation adds a stateless Prometheus Agent that scrapes Node Exporter and forwards the samples to the main Prometheus server through Remote Write.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     N[Node Exporter<br/>Linux metrics<br/>Port 9100]
+    A[Prometheus Agent<br/>Stateless forwarder<br/>Port 9091]
     P[Prometheus<br/>Collection and storage<br/>Port 9090]
     G[Grafana<br/>Visualization<br/>Port 3000]
 
-    P -->|Scrape every 15 seconds| N
+    P -->|Direct scrape| N
+    A -->|Pull every 15 seconds| N
+    A -->|Remote Write push| P
     G -->|PromQL queries| P
 ```
 
@@ -18,13 +21,14 @@ flowchart LR
 |---|---|---|
 | Prometheus | Collects, stores, and queries metrics | `http://localhost:9090` |
 | Node Exporter | Exposes CPU, memory, disk, and network metrics | `http://localhost:9100/metrics` |
+| Prometheus Agent | Scrapes and forwards metrics without a full local TSDB | `http://localhost:9091` |
 | Grafana | Displays metrics in dashboards | `http://localhost:3000` |
 
 ## Prerequisites
 
 - Docker and Docker Compose
 - A Linux host, a Linux virtual machine, or WSL with Docker Desktop
-- Ports `3000`, `9090`, and `9100` available
+- Ports `3000`, `9090`, `9091`, and `9100` available
 
 > Node Exporter is designed for Linux and Unix systems. With WSL and Docker Desktop, the collected metrics mainly describe the Linux environment used by Docker rather than the native Windows host.
 
@@ -34,7 +38,8 @@ flowchart LR
 tp-monitoring-prometheus-grafana/
 ├── docker-compose.yml
 ├── prometheus/
-│   └── prometheus.yml
+│   ├── prometheus.yml
+│   └── prometheus-agent.yml
 ├── screenshots/
 └── README.md
 ```
@@ -49,7 +54,7 @@ First, validate the Compose file:
 docker compose config
 ```
 
-Start all three services:
+Start all four services:
 
 ```bash
 docker compose up -d
@@ -61,7 +66,7 @@ Check their status:
 docker compose ps
 ```
 
-The `prometheus`, `node-exporter`, and `grafana` containers should be `Up` or `running`.
+The `prometheus`, `prometheus-agent`, `node-exporter`, and `grafana` containers should be `Up` or `running`.
 
 ## Prometheus configuration
 
@@ -166,19 +171,87 @@ Select the Prometheus data source and the `node-exporter:9100` instance. A time 
 
 ![Grafana dashboard displaying CPU memory network and disk metrics](screenshots/grafana_dashboard.png)
 
+## Bonus Prometheus Agent and Remote Write
+
+The bonus adds a second Prometheus instance running in Agent mode. It pulls metrics from Node Exporter and pushes them to the main Prometheus server.
+
+The main Prometheus enables its receiver with:
+
+```yaml
+command:
+  - "--config.file=/etc/prometheus/prometheus.yml"
+  - "--web.enable-remote-write-receiver"
+```
+
+The Agent uses `prometheus/prometheus-agent.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+  external_labels:
+    source: "prometheus-agent"
+
+scrape_configs:
+  - job_name: "node-exporter-via-agent"
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+
+remote_write:
+  - url: "http://prometheus:9090/api/v1/write"
+```
+
+The `source="prometheus-agent"` external label distinguishes samples forwarded by the Agent from metrics scraped directly by the main server.
+
+Validate the Agent configuration with:
+
+```bash
+docker compose run --rm --entrypoint promtool prometheus-agent \
+  check config /etc/prometheus/prometheus-agent.yml
+```
+
+The Agent target is available from [http://localhost:9091/targets](http://localhost:9091/targets).
+
+![Node Exporter target scraped by the Prometheus Agent](screenshots/second%20agent%20up.png)
+
+The following query, executed on the main Prometheus server, proves that forwarded samples have arrived:
+
+```promql
+up{job="node-exporter-via-agent", source="prometheus-agent"}
+```
+
+![Forwarded Agent metric available in the main Prometheus](screenshots/quesry_verif_agent.png)
+
+The total number of series received from the Agent can be checked with:
+
+```promql
+count({source="prometheus-agent"})
+```
+
+![Number of metric series received from the Prometheus Agent](screenshots/metric_count.png)
+
+The screenshots confirm the complete bonus data path:
+
+```text
+Node Exporter -> Prometheus Agent -> Remote Write -> Main Prometheus -> Grafana
+```
+
 ## Final verification
 
 ```bash
 docker compose ps
 curl --fail http://localhost:9090/-/ready
+curl --fail http://localhost:9091/-/ready
 curl --fail http://localhost:9100/metrics
 curl --fail http://localhost:3000/api/health
 ```
 
 The lab is complete when:
 
-- all three containers are running;
+- all four containers are running;
 - both Prometheus targets are `UP`;
+- the Agent target `node-exporter-via-agent` is `UP`;
+- the main Prometheus returns Agent metrics with `source="prometheus-agent"`;
 - the PromQL queries return data;
 - Grafana can query Prometheus;
 - the dashboard displays CPU, memory, disk, and network metrics;
@@ -204,6 +277,23 @@ docker compose logs --tail=50 node-exporter
 ```
 
 Also confirm that the Prometheus target is set to `node-exporter:9100`.
+
+### The Prometheus Agent keeps restarting
+
+If the logs contain `opening storage failed` or `permission denied`, use the writable `/prometheus` directory for the temporary Agent WAL:
+
+```yaml
+command:
+  - "--agent"
+  - "--config.file=/etc/prometheus/prometheus-agent.yml"
+  - "--storage.agent.path=/prometheus"
+```
+
+Do not attach a persistent volume to this path when the Agent must remain stateless. Recreate it after changing the command:
+
+```bash
+docker compose up -d --force-recreate prometheus-agent
+```
 
 ### Grafana displays `No data`
 

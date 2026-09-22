@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+  external_labels:
+    source: "prometheus-agent"
+
+scrape_configs:
+  - job_name: "node-exporter-via-agent"
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+
+remote_write:
+  - url: "http://prometheus:9090/api/v1/write"
